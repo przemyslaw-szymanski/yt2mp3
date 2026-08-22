@@ -12,6 +12,7 @@ FFmpeg must also be installed and on PATH (needed for audio extraction).
 """
 
 import argparse
+import re
 import sys
 import os
 
@@ -20,7 +21,9 @@ def BuildArgParser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         description="Download a YouTube video or playlist as MP3 file(s).",
     )
-    p.add_argument("url", help="YouTube video or playlist URL.")
+    p.add_argument("url", help="YouTube video or playlist URL. "
+                             "IMPORTANT: wrap in double quotes if the URL contains '&', e.g.: "
+                             'python yt2mp3.py "https://youtube.com/watch?v=ID&list=PL..."')
     p.add_argument(
         "-o", "--output",
         default=".",
@@ -59,17 +62,41 @@ def BuildArgParser() -> argparse.ArgumentParser:
         help="Comma-separated yt-dlp player clients to try (e.g. android,ios,web,mweb). "
              "android bypasses most 403/bot-detection errors without needing cookies. Default: android,web.",
     )
+    p.add_argument(
+        "--no-archive",
+        action="store_true",
+        help="Disable the download archive and re-download already downloaded files.",
+    )
+    p.add_argument(
+        "--archive-file",
+        metavar="FILE",
+        default=None,
+        help="Path to the download archive file. "
+             "Default: download-archive.txt inside the output directory.",
+    )
     return p
 
 
 def BuildYdlOptions(args: argparse.Namespace) -> dict:
     os.makedirs(args.output, exist_ok=True)
 
-    # yt-dlp output template: artist – title when metadata is available, otherwise just title.
-    outtmpl = os.path.join(
-        args.output,
-        "%(artist,uploader)s - %(title)s.%(ext)s",
+    # A playlist URL (query has "list=", or a "/playlist" path) gets its own subfolder named
+    # after the playlist, so each playlist downloaded into the same --output stays separated.
+    # Single-video URLs (or --no-playlist) keep the flat "<output>/artist - title.mp3" layout.
+    is_playlist_url = not args.no_playlist and bool(
+        re.search(r"[?&]list=", args.url) or "/playlist" in args.url
     )
+    if is_playlist_url:
+        outtmpl = os.path.join(
+            args.output,
+            "%(playlist_title,playlist_id,playlist)s",
+            "%(playlist_index)s - %(artist,uploader)s - %(title)s.%(ext)s",
+        )
+    else:
+        outtmpl = os.path.join(
+            args.output,
+            "%(artist,uploader)s - %(title)s.%(ext)s",
+        )
 
     # The android client is unauthenticated but returns real audio/video formats;
     # it bypasses the bot-detection 403 that the plain web client hits on many videos.
@@ -111,6 +138,14 @@ def BuildYdlOptions(args: argparse.Namespace) -> dict:
     if args.cookies_from_browser:
         opts["cookiesfrombrowser"] = (args.cookies_from_browser,)
 
+    # Record every downloaded video ID so subsequent runs skip already-fetched files.
+    # The archive file lives next to the MP3s by default so playlist re-runs are safe.
+    if not args.no_archive:
+        archive_file = args.archive_file or os.path.join(
+            os.path.abspath(args.output), "download-archive.txt"
+        )
+        opts["download_archive"] = archive_file
+
     return opts
 
 
@@ -119,14 +154,56 @@ def Main() -> int:
         import yt_dlp
     except ImportError:
         print("Error: yt-dlp is not installed. Run:  pip install yt-dlp", file=sys.stderr)
+        print("FFmpeg must also be installed and on PATH (needed for audio extraction): winget install --id=Gyan.FFmpeg.", file=sys.stderr)
         return 1
 
     args = BuildArgParser().parse_args()
+
+    # Detect URLs that were split by the Windows CMD '&' command separator.
+    # When a URL like "?v=ID&list=PL..." is passed without quotes in CMD, the shell
+    # treats '&' as a command separator and Python only receives the truncated part
+    # before the first '&'. The 'list=...' and 'index=...' tokens are executed as
+    # separate (failing) shell commands and are never visible to this script.
+    url = args.url
+    if ("youtube.com" in url or "youtu.be" in url) and "&" not in url and "?" in url:
+        print(
+            "\nWarning: the URL looks truncated - '&list=...' or '&index=...' parameters are missing.\n"
+            "On Windows CMD the '&' character splits the command line.\n"
+            "Wrap the URL in double quotes and run again:\n"
+            f'  python yt2mp3.py "{url}&list=PLAYLIST_ID"\n',
+            file=sys.stderr,
+        )
+
     opts = BuildYdlOptions(args)
 
     print(f"Downloading to: {os.path.abspath(args.output)}")
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        ret = ydl.download([args.url])
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            ret = ydl.download([args.url])
+    except yt_dlp.utils.DownloadError as e:
+        msg = str(e)
+        if "Private video" in msg or "Sign in" in msg:
+            browser_hint = args.cookies_from_browser or "edge"
+            print(
+                "\nThis video is private. You need to be signed in to a YouTube account that "
+                "has access to it.\n"
+                "Pass your browser cookies so yt-dlp can authenticate:\n\n"
+                f"  python yt2mp3.py \"<URL>\" --cookies-from-browser {browser_hint}\n\n"
+                "Supported browsers: chrome, firefox, edge, opera, brave, chromium, safari\n"
+                "Make sure you are already logged in to YouTube in that browser before running.",
+                file=sys.stderr,
+            )
+        elif "Could not copy" in msg and "cookie database" in msg:
+            print(
+                "\nCould not read the browser's cookie database because the browser is running "
+                "and has it locked.\n"
+                f"Close all {args.cookies_from_browser} windows completely (check the system tray/"
+                "Task Manager for background processes) and run the command again.\n"
+                "Alternatively, use a different browser you are logged into YouTube with, e.g.:\n\n"
+                "  python yt2mp3.py \"<URL>\" --cookies-from-browser firefox\n",
+                file=sys.stderr,
+            )
+        return 1
 
     return ret
 
